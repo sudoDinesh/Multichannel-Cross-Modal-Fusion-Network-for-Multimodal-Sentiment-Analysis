@@ -4,17 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 import os
 
-def load_acoustic_features(feature_dir):
-    
-    try:
-        feature_files = sorted(os.listdir(feature_dir))
-        features = [np.load(os.path.join(feature_dir, file), allow_pickle=True) for file in feature_files]
-        features = np.stack(features, axis=0)
-        return torch.tensor(features, dtype=torch.float32)
-    except Exception as e:
-        print(f"Error loading acoustic features: {e} on Channel 2")
-        return None
-
 
 class AuxiliaryModalRedundancyReduction(nn.Module):
     def __init__(self, input_dim, output_dim):

@@ -46,8 +46,13 @@ acoustic_features = acoustic_features.to(device)
 model = CrossModalAttention(input_dim=input_dim, output_dim=output_dim).to(device)
 F1 = model(text_features, acoustic_features)
 
-model = AuxiliaryModalRedundancyReduction(input_dim=input_dim, output_dim=output_dim).to(device)
+model = AuxiliaryModalRedundancyReduction(input_dim=16, output_dim=output_dim).to(device)
 F2 = model(acoustic_features)
 
 model = TextGuidedInformationInteractiveLearning(input_dim=input_dim, output_dim=output_dim).to(device)
 F3 = model(F1, text_features)
+
+
+print(F1.shape)
+print(F2.shape)
+print(F3.shape)

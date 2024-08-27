@@ -25,17 +25,3 @@ class TextGuidedInformationInteractiveLearning(nn.Module):
         F3 = self.output_linear(attn_output) + Q_d
 
         return F3
-
-def load_features(feature_dir):
-    feature_files = sorted(os.listdir(feature_dir))
-    features = []
-    for file in feature_files:
-        if file.endswith('.npy'):  # Load only .npy files
-            file_path = os.path.join(feature_dir, file)
-            try:
-                data = np.load(file_path, allow_pickle=True)
-                features.append(data)
-            except Exception as e:
-                print(f"Error loading {file_path}: {e} on Channel 3")
-    features = np.stack(features, axis=0)  # Stack into a single tensor
-    return torch.tensor(features, dtype=torch.float32)
