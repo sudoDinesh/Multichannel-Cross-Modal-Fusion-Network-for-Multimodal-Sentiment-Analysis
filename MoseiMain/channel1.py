@@ -15,7 +15,6 @@ class CrossModalAttention(nn.Module):
         self.output_dim = output_dim
 
     def forward(self, text_features, acoustic_features):
-        # Reshape acoustic features to match text features dimension
         acoustic_features = acoustic_features.unsqueeze(1).expand(-1, text_features.size(1), -1)
 
         # Step 1: Embedding

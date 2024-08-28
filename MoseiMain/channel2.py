@@ -14,7 +14,7 @@ class AuxiliaryModalRedundancyReduction(nn.Module):
 
     def forward(self, acoustic_features):
         if acoustic_features.dim() == 2:
-            acoustic_features = acoustic_features.unsqueeze(1)  # Add sequence length dimension if missing
+            acoustic_features = acoustic_features.unsqueeze(1) 
 
         acoustic_queries = self.acoustic_linear_Q(acoustic_features)
         acoustic_keys = self.acoustic_linear_K(acoustic_features)
