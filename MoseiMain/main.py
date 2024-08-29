@@ -8,32 +8,41 @@ from channel3 import TextGuidedInformationInteractiveLearning
 import numpy as np
 import os
 from itertools import chain
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+from sklearn.preprocessing import LabelBinarizer
+
+torch.autograd.set_detect_anomaly(True)
 
 # Paths and device configuration
 text_path = r"/Users/dinesh/College/final proj/attempt3/features/text"
 audio_path = r"/Users/dinesh/College/final proj/attempt3/features/audio"
-csv_path = r"/Users/dinesh/College/final proj/attempt3/updatedMoseiData/new_mosei.csv"
+csv_path = r"/Users/dinesh/College/final proj/attempt3/updatedMoseiData/processed_mosei.csv"
 input_dim = 768  
 output_dim = 128  
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-# Load labels
+# Load labels and preprocess
 labels_df = pd.read_csv(csv_path)
-labels_tensor = torch.tensor(labels_df[['happy', 'sad', 'anger', 'surprise', 'disgust', 'fear']].values, dtype=torch.float32).to(device)
+sentiment_labels = labels_df['sentiment_label'].tolist()
+
+# Encode sentiment labels to one-hot vectors
+label_binarizer = LabelBinarizer()
+label_binarizer.fit(['negative', 'neutral', 'positive'])
+sentiment_tensor = torch.tensor(label_binarizer.transform(sentiment_labels), dtype=torch.float32).to(device)
 
 # Load features
 def load_features(feature_dir):
     feature_files = sorted(os.listdir(feature_dir))
     features = []
     for file in feature_files:
-        if file.endswith('.npy'):  
+        if file.endswith('.npy'):
             file_path = os.path.join(feature_dir, file)
             try:
                 data = np.load(file_path, allow_pickle=True)
                 features.append(data)
             except Exception as e:
                 print(f"Error loading {file_path}: {e}")
-    features = np.stack(features, axis=0)  
+    features = np.stack(features, axis=0)
     return torch.tensor(features, dtype=torch.float32)
 
 text_features = load_features(text_path).to(device)
@@ -41,20 +50,8 @@ acoustic_features = load_features(audio_path).to(device)
 
 # Initialize models
 model1 = CrossModalAttention(input_dim=input_dim, output_dim=output_dim).to(device)
-F1 = model1(text_features, acoustic_features)
-
 model2 = AuxiliaryModalRedundancyReduction(input_dim=16, output_dim=output_dim).to(device)
-F2 = model2(acoustic_features)
-
 model3 = TextGuidedInformationInteractiveLearning(input_dim=input_dim, output_dim=output_dim).to(device)
-F3 = model3(F1, text_features)
-
-print(F1.shape)
-print(F2.shape)
-print(F3.shape)
-
-# Combine outputs using element-wise addition
-combined_output = F1 + F2 + F3
 
 # Add a linear layer to transform combined_output to BERT's expected dimension
 class FeatureTransformer(nn.Module):
@@ -67,7 +64,6 @@ class FeatureTransformer(nn.Module):
 
 # Initialize transformer and adjust dimensions
 feature_transformer = FeatureTransformer(input_dim=output_dim, output_dim=768).to(device)
-transformed_output = feature_transformer(combined_output)
 
 # Load pre-trained BERT model
 model_name = 'bert-base-uncased'
@@ -85,8 +81,7 @@ class CustomModel(nn.Module):
         self.sigmoid = nn.Sigmoid()  # For multilabel classification
 
     def forward(self, x):
-        # BERT expects input_ids and attention_mask
-        # Here we use inputs_embeds to pass the precomputed embeddings
+        # Use inputs_embeds to pass precomputed embeddings to BERT
         outputs = self.bert(inputs_embeds=x)
         x = outputs.last_hidden_state.mean(dim=1)  # Pooling BERT outputs
         x = self.fc1(x)
@@ -94,8 +89,9 @@ class CustomModel(nn.Module):
         x = self.fc2(x)
         return self.sigmoid(x)
 
+num_classes = 3
 # Create the custom model instance
-model4 = CustomModel(plm, 768, 6).to(device)
+model4 = CustomModel(plm, 768, num_classes).to(device)
 
 # Define optimizer and loss function
 optimizer = torch.optim.Adam(
@@ -104,53 +100,60 @@ optimizer = torch.optim.Adam(
 )
 criterion = nn.BCEWithLogitsLoss()
 
-# Pass transformed output through the custom model
-op = model4(transformed_output)
-
-
-
-# # Training and evaluation
-# def train_model(model, criterion, optimizer, features, labels):
-#     model.train()
-#     optimizer.zero_grad()
-#     outputs = model(features)
-#     loss = criterion(outputs, labels)
-#     loss.backward()
-#     optimizer.step()
-#     return loss.item()
-
-# # Training loop (example)
-# epochs = 5
-# for epoch in range(epochs):
-#     loss = train_model(model4, criterion, optimizer, combined_output, labels_tensor)
-#     print(f'Epoch {epoch+1}/{epochs}, Loss: {loss:.4f}')
-
-# # Threshold tuning function
-# def tune_thresholds(y_true, y_pred_probs):
-#     best_thresholds = []
+# Training and evaluation
+def train_model(model, feature_transformer, criterion, optimizer, text_features, acoustic_features, labels):
+    model.train()
+    optimizer.zero_grad()
     
-#     # Iterate over each emotion (output dimension)
-#     for i in range(y_pred_probs.shape[1]):
-#         best_f1 = 0
-#         best_threshold = 0.5
-        
-#         # Test different thresholds from 0.1 to 0.9
-#         for threshold in np.arange(0.1, 1.0, 0.1):
-#             y_pred = (y_pred_probs[:, i] >= threshold).astype(int)
-#             f1 = f1_score(y_true[:, i].cpu().numpy(), y_pred)
-            
-#             if f1 > best_f1:
-#                 best_f1 = f1
-#                 best_threshold = threshold
-        
-#         best_thresholds.append(best_threshold)
+    # Forward pass through the first three channels
+    F1 = model1(text_features, acoustic_features)
+    F2 = model2(acoustic_features)
+    F3 = model3(F1, text_features)
+
+    # Combine outputs using element-wise addition
+    combined_output = F1 + F2 + F3
+
+    # Transform features
+    transformed_output = feature_transformer(combined_output)
     
-#     return best_thresholds
+    # Forward pass through BERT-based model
+    outputs = model(transformed_output)
+    
+    # Compute loss
+    loss = criterion(outputs, labels)
+    
+    # Backward pass
+    loss.backward()
+    
+    # Optimizer step
+    optimizer.step()
+    
+    return loss.item(), outputs
 
-# # After training, evaluate and tune thresholds
-# model4.eval()
-# with torch.no_grad():
-#     outputs = model4(combined_output)
-#     best_thresholds = tune_thresholds(labels_tensor, outputs)
+# Function to calculate evaluation metrics and print sample labels and predictions
+def evaluate_model(outputs, labels, sample_indices):
+    # Convert logits to predictions
+    preds = torch.round(torch.sigmoid(outputs)).cpu().detach().numpy()
+    labels = labels.cpu().detach().numpy()
+    
+    # Print sample labels and predictions
+    for i in sample_indices:
+        label = label_binarizer.inverse_transform([labels[i]])[0]
+        prediction = label_binarizer.inverse_transform([preds[i]])[0]
+        print(f"Sample {i} - Label: {label}, Prediction: {prediction}")
+    
+    # Calculate metrics
+    accuracy = accuracy_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1))
+    precision = precision_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
+    recall = recall_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
+    f1 = f1_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
+    
+    return accuracy, precision, recall, f1
 
-# print("Optimal thresholds for each emotion:", best_thresholds)
+# Training loop
+epochs = 5
+sample_indices = [0, 1, 2]  # Adjust as needed to print different sample indices
+for epoch in range(epochs):
+    loss, outputs = train_model(model4, feature_transformer, criterion, optimizer, text_features, acoustic_features, sentiment_tensor)
+    accuracy, precision, recall, f1 = evaluate_model(outputs, sentiment_tensor, sample_indices)
+    print(f'Epoch {epoch+1}/{epochs}, Loss: {loss:.4f}, Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}')
