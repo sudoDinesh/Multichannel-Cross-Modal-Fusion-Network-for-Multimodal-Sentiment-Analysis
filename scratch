@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+from sklearn.preprocessing import LabelEncoder
+import pandas as pd
+import numpy as np
+import librosa
+from torch.nn.utils.rnn import pad_sequence
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+class MultimodalAttention(nn.Module):
+    def __init__(self, text_input_dim, audio_input_dim, hidden_dim, num_heads, dropout=0.1):
+        super(MultimodalAttention, self).__init__()
+        self.tembedding = nn.Linear(text_input_dim, hidden_dim)
+        self.aembedding = nn.Linear(audio_input_dim, hidden_dim)
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.multihead_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout)
+        self.text_encoder = nn.TransformerEncoderLayer(hidden_dim, num_heads, dropout=dropout)
+        self.multihead_attn_c3 = nn.MultiheadAttention(hidden_dim, 8, dropout=dropout)
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.fc1 = nn.Linear(768, 256)  # Fix input dimension to 768
+        self.fc_transform_to_768 = nn.Linear(hidden_dim, 768)  # Transform hidden_dim (256) back to 768
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(256, 3)
+
+    def forward(self, Xt, Xa, attention_mask):
+        bert_outputs = self.bert(input_ids=Xt, attention_mask=attention_mask)
+        ft = bert_outputs.last_hidden_state  # Shape: [batch_size, sequence_length, 768]
+        ft = ft.mean(dim=1)  
+        ft = self.tembedding(ft)
+        fa = self.aembedding(Xa)
+        Qa = self.query(fa)
+        Ka = self.key(fa)
+        Va = self.value(fa)
+        Atten_a, _ = self.multihead_attn(Qa, Ka, Va)
+        F1 = ft + Atten_a
+        F2 = Atten_a
+        ft_text_encoded = self.text_encoder(ft)
+        ft_text_encoded = ft_text_encoded.unsqueeze(0) if ft_text_encoded.dim() == 2 else ft_text_encoded
+        F3, _ = self.multihead_attn_c3(F1, ft_text_encoded, ft_text_encoded)
+        combined_output = F1 + F2 + F3
+
+        # Transform combined_output to match BERT input size
+        combined_output = self.fc_transform_to_768(combined_output)
+
+        # Combine text and audio embeddings and pass to classifier
+        o1 = self.bert(inputs_embeds=combined_output)
+        o1 = o1.last_hidden_state.mean(dim=1)
+        o1 = self.fc1(o1)
+        o1 = self.relu(o1)
+        o1 = self.fc2(o1)
+        return nn.Softmax(dim=1)(o1)
+
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+# Assuming data loading is already done and dataframe is available as df
+data_path = "/Users/dinesh/College/final proj/attempt3/updatedMoseiData"
+df = pd.read_csv(f"{data_path}/processed_mosei.csv")
+
+# Extract text, audio paths, and labels
+text_data = df["text"].tolist()
+audio_paths = [f"{data_path}/audio/{file}" for file in df["file_name"]]
+labels = df["sentiment_label"].tolist()
+
+# Encode labels
+label_encoder = LabelEncoder()
+labels = label_encoder.fit_transform(labels)
+
+class AudioTextDataset(Dataset):
+    def __init__(self, text_data, audio_paths, labels):
+        self.text_data = text_data
+        self.audio_paths = audio_paths
+        self.labels = labels
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    def __len__(self):
+        return len(self.text_data)
+
+    def __getitem__(self, idx):
+        text = self.text_data[idx]
+        audio_path = self.audio_paths[idx]
+        label = self.labels[idx]
+
+        # Load audio and extract features
+        y, sr = librosa.load(audio_path)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=40)
+        rms = librosa.feature.rms(y=y)
+        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
+        zero_crossing_rate = librosa.feature.zero_crossing_rate(y=y)
+        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
+
+        # Ensure audio features have the correct dimension
+        audio_features = np.concatenate((
+            mfcc.mean(axis=1),
+            rms.mean(axis=1).flatten(),
+            spectral_centroid.mean(axis=1).flatten(),
+            zero_crossing_rate.mean(axis=1).flatten(),
+            rolloff.mean(axis=1).flatten()
+        ))
+
+        # Expand dimensions to add the sequence length (1 in this case)
+        audio_features = np.expand_dims(audio_features, axis=0)  # Shape: (1, feature_dim)
+
+        # Tokenize and encode text using a pre-trained language model
+        tokenized_input = self.tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
+        input_ids = tokenized_input['input_ids'].squeeze(0)
+        attention_mask = tokenized_input['attention_mask'].squeeze(0)
+
+        return input_ids, torch.tensor(audio_features, dtype=torch.float32), label, attention_mask
+        
+# Custom collate function to handle variable-length sequences
+def collate_fn(batch):
+    input_ids, audio_features, labels, attention_masks = zip(*batch)
+
+    # Pad the text sequences
+    input_ids_padded = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    attention_masks_padded = pad_sequence(attention_masks, batch_first=True, padding_value=0)
+    audio_features_stacked = torch.stack(audio_features)
+    labels_tensor = torch.tensor(labels)
+    
+    return input_ids_padded, audio_features_stacked, labels_tensor, attention_masks_padded
+
+dataset = AudioTextDataset(text_data, audio_paths, labels)
+dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+
+# Define the model, criterion, and optimizer
+text_input_dim = 768  # Use BERT output dimension
+audio_input_dim = 44
+hidden_dim = 256
+num_heads = 4
+model = MultimodalAttention(text_input_dim, audio_input_dim, hidden_dim, num_heads).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# Training function
+def train(model, dataloader, optimizer, criterion, num_epochs):
+    model.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for i, (Xt, Xa, labels, attention_mask) in enumerate(dataloader):
+            Xt, Xa, labels, attention_mask = Xt.to(device), Xa.to(device), labels.to(device), attention_mask.to(device)
+            optimizer.zero_grad()
+            outputs = model(Xt, Xa, attention_mask)
+            if(epoch == 99):
+                _, predicted_labels = torch.max(outputs, 1)
+                print(f"Predicted Labels: {predicted_labels.tolist()}")
+                print(f"Actual Labels: {labels.tolist()}")
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+            if (i + 1) % 10 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(dataloader):.4f}")
+
+# Start training
+num_epochs = 100
+train(model, dataloader, optimizer, criterion, num_epochs)

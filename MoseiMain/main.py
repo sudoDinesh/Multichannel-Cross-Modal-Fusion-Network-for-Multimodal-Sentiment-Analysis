@@ -9,7 +9,7 @@ import numpy as np
 import os
 from itertools import chain
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
-from sklearn.preprocessing import LabelBinarizer
+from sklearn.preprocessing import LabelEncoder
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -25,10 +25,11 @@ device = 'mps' if torch.backends.mps.is_available() else 'cpu'
 labels_df = pd.read_csv(csv_path)
 sentiment_labels = labels_df['sentiment_label'].tolist()
 
-# Encode sentiment labels to one-hot vectors
-label_binarizer = LabelBinarizer()
-label_binarizer.fit(['negative', 'neutral', 'positive'])
-sentiment_tensor = torch.tensor(label_binarizer.transform(sentiment_labels), dtype=torch.float32).to(device)
+# Encode sentiment labels to class indices
+label_encoder = LabelEncoder()
+label_encoder.fit(['negative', 'neutral', 'positive'])
+sentiment_indices = label_encoder.transform(sentiment_labels)
+sentiment_tensor = torch.tensor(sentiment_indices, dtype=torch.long).to(device)
 
 # Load features
 def load_features(feature_dir):
@@ -78,8 +79,7 @@ class CustomModel(nn.Module):
         self.fc1 = nn.Linear(input_dim, 256)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(256, num_classes)
-        self.sigmoid = nn.Sigmoid()  # For multilabel classification
-
+    
     def forward(self, x):
         # Use inputs_embeds to pass precomputed embeddings to BERT
         outputs = self.bert(inputs_embeds=x)
@@ -87,7 +87,8 @@ class CustomModel(nn.Module):
         x = self.fc1(x)
         x = self.relu(x)
         x = self.fc2(x)
-        return self.sigmoid(x)
+        # Apply softmax to get class probabilities
+        return nn.Softmax(dim=1)(x)
 
 num_classes = 3
 # Create the custom model instance
@@ -98,7 +99,7 @@ optimizer = torch.optim.Adam(
     chain(model1.parameters(), model2.parameters(), model3.parameters(), feature_transformer.parameters(), model4.parameters()), 
     lr=0.001
 )
-criterion = nn.BCEWithLogitsLoss()
+criterion = nn.CrossEntropyLoss()
 
 # Training and evaluation
 def train_model(model, feature_transformer, criterion, optimizer, text_features, acoustic_features, labels):
@@ -132,21 +133,32 @@ def train_model(model, feature_transformer, criterion, optimizer, text_features,
 
 # Function to calculate evaluation metrics and print sample labels and predictions
 def evaluate_model(outputs, labels, sample_indices):
-    # Convert logits to predictions
-    preds = torch.round(torch.sigmoid(outputs)).cpu().detach().numpy()
+    # Convert probabilities to class predictions using argmax
+    preds = torch.argmax(outputs, dim=1).cpu().detach().numpy()
     labels = labels.cpu().detach().numpy()
     
     # Print sample labels and predictions
     for i in sample_indices:
-        label = label_binarizer.inverse_transform([labels[i]])[0]
-        prediction = label_binarizer.inverse_transform([preds[i]])[0]
+        label = label_encoder.inverse_transform([labels[i]])[0]
+        prediction = label_encoder.inverse_transform([preds[i]])[0]
         print(f"Sample {i} - Label: {label}, Prediction: {prediction}")
     
+    # Count number of records for each class
+    class_counts = {label: 0 for label in label_encoder.classes_}
+    for pred in preds:
+        class_label = label_encoder.inverse_transform([pred])[0]
+        class_counts[class_label] += 1
+    
+    # Print class counts
+    print("Class counts for predictions:")
+    for class_label, count in class_counts.items():
+        print(f"{class_label}: {count}")
+
     # Calculate metrics
-    accuracy = accuracy_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1))
-    precision = precision_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
-    recall = recall_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
-    f1 = f1_score(np.argmax(labels, axis=1), np.argmax(preds, axis=1), average='macro', zero_division=0)
+    accuracy = accuracy_score(labels, preds)
+    precision = precision_score(labels, preds, average='macro', zero_division=0)
+    recall = recall_score(labels, preds, average='macro', zero_division=0)
+    f1 = f1_score(labels, preds, average='macro', zero_division=0)
     
     return accuracy, precision, recall, f1
 
